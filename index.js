@@ -29,11 +29,11 @@ const PROVIDERS = [
     }
 ];
 
-const MAX_PER_PROVIDER = 3; 
+const MAX_PER_PROVIDER = 10; 
 const QUEUE_TIMEOUT = 25000; 
 
 // Filtro suavizado para que tus usuarios disfruten de todos los modelos gratis disponibles
-const BLOCKED_TIERS = ["enterprise", "vip", "commercial_only"];
+const BLOCKED_TIERS = ["enterprise", "vip", "tier:pro"];
 
 function isModelAllowed(modelId, modelObj = null) {
     if (!modelId) return true; 
