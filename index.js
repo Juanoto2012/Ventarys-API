@@ -20,14 +20,19 @@ const PROVIDERS = [
     { 
         id: "llm7", 
         url: "https://api.llm7.io/v1/chat/completions" 
+    },
+    {
+        id: "pollinations",
+        // Proveedor OpenAI compatible que funciona 100% SIN API KEY ni registros
+        url: "https://text.pollinations.ai/v1/chat/completions",
+        modelsUrl: "https://text.pollinations.ai/models"
     }
 ];
 
 const MAX_PER_PROVIDER = 3; 
 const QUEUE_TIMEOUT = 25000; 
 
-// SE SUAVIZÓ EL FILTRO: Ahora se permiten modelos "pro", "plus" o "max" públicos de la API, 
-// bloqueando únicamente términos comerciales corporativos muy específicos para evitar errores.
+// Filtro suavizado para que tus usuarios disfruten de todos los modelos gratis disponibles
 const BLOCKED_TIERS = ["enterprise", "vip", "commercial_only"];
 
 function isModelAllowed(modelId, modelObj = null) {
@@ -37,13 +42,14 @@ function isModelAllowed(modelId, modelObj = null) {
     if (modelObj && modelObj.tier) {
         const tier = modelObj.tier.toLowerCase();
         if (tier === "vip" || tier === "enterprise") return false;
-        return true; // Permitir free, standard, pro, etc., si vienen abiertos por el proveedor
+        return true;
     }
     
     return !BLOCKED_TIERS.some(keyword => lowerId.includes(keyword));
 }
 
-let currentLoad = { "llm7": 0 };
+// El balanceador ahora reparte la carga entre llm7 y pollinations
+let currentLoad = { "llm7": 0, "pollinations": 0 };
 
 const limiter = rateLimit({
     windowMs: 60 * 1000, 
