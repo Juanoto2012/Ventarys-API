@@ -4,14 +4,12 @@ import rateLimit from 'express-rate-limit';
 import { Readable } from 'stream';
 
 const app = express();
-// Zeabur asigna automáticamente un puerto dinámico mediante la variable de entorno PORT
 const PORT = process.env.PORT || 7860;
 
 app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
-// --- FUNCIÓN DE LOGS (RESPETANDO PRIVACIDAD) ---
 function logError(providerId, reason) {
     const timestamp = new Date().toISOString();
     console.error(`[${timestamp}] [ERROR] Proveedor: ${providerId} | Motivo: ${reason}`);
@@ -28,16 +26,20 @@ const PROVIDERS = [
 const MAX_PER_PROVIDER = 3; 
 const QUEUE_TIMEOUT = 25000; 
 
-const BLOCKED_TIERS = ["pro", "premium", "ultra", "vip", "plus", "enterprise", "max"];
+// SE SUAVIZÓ EL FILTRO: Ahora se permiten modelos "pro", "plus" o "max" públicos de la API, 
+// bloqueando únicamente términos comerciales corporativos muy específicos para evitar errores.
+const BLOCKED_TIERS = ["enterprise", "vip", "commercial_only"];
 
 function isModelAllowed(modelId, modelObj = null) {
     if (!modelId) return true; 
     const lowerId = modelId.toLowerCase();
+    
     if (modelObj && modelObj.tier) {
         const tier = modelObj.tier.toLowerCase();
-        if (tier === "pro" || tier === "premium" || tier === "vip") return false;
-        if (tier === "free" || tier === "standard") return true;
+        if (tier === "vip" || tier === "enterprise") return false;
+        return true; // Permitir free, standard, pro, etc., si vienen abiertos por el proveedor
     }
+    
     return !BLOCKED_TIERS.some(keyword => lowerId.includes(keyword));
 }
 
@@ -46,12 +48,11 @@ let currentLoad = { "llm7": 0 };
 const limiter = rateLimit({
     windowMs: 60 * 1000, 
     max: 25, 
-    message: { error: { message: "Límite alcanzado. Espera 1 minuto entre mensajes.", code: 429 } },
+    message: { error: { message: "Límite alcanzado. Espera 1 minuto.", code: 429 } },
     standardHeaders: true,
     legacyHeaders: false,
 });
 
-// --- RUTAS INFORMATIVAS ---
 app.get('/health', (req, res) => {
     res.json({ 
         status: "online", 
@@ -68,22 +69,15 @@ app.get('/v1/models', async (req, res) => {
             const fetchHeaders = { "Content-Type": "application/json" };
             
             if (provider.apiKey) fetchHeaders["Authorization"] = `Bearer ${provider.apiKey}`;
-            if (provider.proxySecret) fetchHeaders["X-Proxy-Secret"] = provider.proxySecret;
 
             const resp = await fetch(modelsUrl, { method: "GET", headers: fetchHeaders });
-            if (!resp.ok) {
-                logError(provider.id, `Fallo al recuperar modelos (HTTP ${resp.status})`);
-                throw new Error(`HTTP Error ${resp.status}`);
-            }
+            if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
             
             const json = await resp.json();
             let modelsArray = [];
 
-            if (Array.isArray(json)) {
-                modelsArray = json; 
-            } else if (json && Array.isArray(json.data)) {
-                modelsArray = json.data; 
-            }
+            if (Array.isArray(json)) modelsArray = json; 
+            else if (json && Array.isArray(json.data)) modelsArray = json.data; 
 
             if (modelsArray.length > 0) {
                 return modelsArray
@@ -105,23 +99,17 @@ app.get('/v1/models', async (req, res) => {
 
         res.json({ object: "list", data: allModels });
     } catch (error) {
-        logError("ProxyMain", "Error crítico al agrupar la lista de modelos.");
         res.status(500).json({ error: "No se pudieron recuperar los modelos." });
     }
 });
 
-// --- RUTA PRINCIPAL DE GENERACIÓN ---
 app.post(['/v1/chat/completions', '/v1/images/generations'], limiter, async (req, res) => {
     const isImage = req.path === '/v1/images/generations';
     const requestedModel = req.body.model;
 
     if (requestedModel && !isModelAllowed(requestedModel)) {
-        logError("ProxyMain", `Bloqueado intento de uso de modelo premium: ${requestedModel}`);
         return res.status(403).json({
-            error: { 
-                message: `Acceso denegado: El modelo '${requestedModel}' es de pago (Premium/Pro).`, 
-                type: "model_not_allowed", code: 403 
-            }
+            error: { message: `Acceso denegado: Este modelo requiere permisos especiales.`, code: 403 }
         });
     }
 
@@ -143,8 +131,7 @@ app.post(['/v1/chat/completions', '/v1/images/generations'], limiter, async (req
     }
 
     if (!selectedProvider) {
-        logError("ProxyMain", "Saturación - La API está ocupada (Cola llena)");
-        return res.status(503).json({ error: { message: "La API está ocupada. Por favor, reintenta.", code: 503 } });
+        return res.status(503).json({ error: { message: "API ocupada.", code: 503 } });
     }
 
     let isReleased = false;
@@ -160,7 +147,6 @@ app.post(['/v1/chat/completions', '/v1/images/generations'], limiter, async (req
         const fetchHeaders = { "Content-Type": "application/json" };
         
         if (selectedProvider.apiKey) fetchHeaders["Authorization"] = `Bearer ${selectedProvider.apiKey}`;
-        if (selectedProvider.proxySecret) fetchHeaders["X-Proxy-Secret"] = selectedProvider.proxySecret;
 
         const response = await fetch(targetUrl, {
             method: "POST",
@@ -168,52 +154,17 @@ app.post(['/v1/chat/completions', '/v1/images/generations'], limiter, async (req
             body: JSON.stringify(req.body)
         });
 
-        if (!response.ok) {
-            logError(selectedProvider.id, `Respuesta HTTP ${response.status} - ${response.statusText}`);
-        }
-
-        // --- MANEJO DE IMÁGENES (Conversión a Base64) ---
         if (isImage) {
             const contentType = response.headers.get("content-type") || "";
-
             if (contentType.includes("application/json")) {
                 const jsonResp = await response.json();
-                
-                if (jsonResp.data && Array.isArray(jsonResp.data)) {
-                    for (let item of jsonResp.data) {
-                        if (item.url && !item.b64_json) {
-                            try {
-                                const imgRes = await fetch(item.url);
-                                const arrayBuffer = await imgRes.arrayBuffer();
-                                item.b64_json = Buffer.from(arrayBuffer).toString('base64');
-                                delete item.url; 
-                            } catch (e) {
-                                logError(selectedProvider.id, `Fallo al convertir la URL de imagen a Base64: ${e.message}`);
-                            }
-                        }
-                    }
-                }
                 releaseSlot();
                 return res.status(response.status).json(jsonResp);
-            } 
-            else if (contentType.includes("image/")) {
-                const arrayBuffer = await response.arrayBuffer();
-                const b64 = Buffer.from(arrayBuffer).toString('base64');
-                releaseSlot();
-                
-                return res.status(200).json({
-                    created: Math.floor(Date.now() / 1000),
-                    data: [{ b64_json: b64 }]
-                });
-            } 
-            else {
-                const textResp = await response.text();
-                releaseSlot();
-                return res.status(response.status).type(contentType).send(textResp);
             }
+            releaseSlot();
+            return res.status(response.status).send(await response.text());
         } 
         
-        // --- MANEJO DE CHAT (Streaming) ---
         res.writeHead(response.status, {
             'Content-Type': response.headers.get('content-type') || 'text/event-stream',
             'Cache-Control': 'no-cache',
@@ -223,12 +174,8 @@ app.post(['/v1/chat/completions', '/v1/images/generations'], limiter, async (req
         if (response.body) {
             const stream = Readable.fromWeb(response.body);
             stream.pipe(res);
-            
             stream.on('end', releaseSlot);
-            stream.on('error', (err) => {
-                logError(selectedProvider.id, `Stream roto a mitad de la respuesta: ${err.message}`);
-                releaseSlot();
-            });
+            stream.on('error', releaseSlot);
             req.on('close', releaseSlot); 
         } else {
             releaseSlot();
@@ -237,11 +184,14 @@ app.post(['/v1/chat/completions', '/v1/images/generations'], limiter, async (req
 
     } catch (err) {
         releaseSlot();
-        logError(selectedProvider.id, `Fallo de red o Timeout conectando al proveedor: ${err.message}`);
         res.status(500).json({ error: `Error de conexión interna.` });
     }
 });
 
+app.use((req, res) => {
+    res.status(404).json({ error: "Ruta no encontrada." });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 API Proxy (Node.js) corriendo seguro en el puerto ${PORT}`);
+    console.log(`🚀 API Proxy corriendo en el puerto ${PORT}`);
 });
